@@ -69,7 +69,7 @@ class MTKFileHandler(RealTimeHandler):
         self.mtk.port.cdc.disconnect()
 
     def seek(self, pos: int) -> bool:
-        if pos <= self.filesize:
+        if self.filesize is None or pos <= self.filesize:
             self.mtk_pos = self.preoffset
             self.curoffset = pos
             self.curblock = pos // self.mtk.config.pagesize

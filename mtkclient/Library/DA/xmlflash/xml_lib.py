@@ -1155,7 +1155,14 @@ class DAXML(metaclass=LogBase):
             self.info(f"Formatting addr {hex(addr)} with length {hex(length)}, please standby....")
             pg.update(length)
         self.send_command(self.cmd.cmd_erase_flash(partition=parttype, offset=addr, length=length))
-        result = self.get_response()
+        # Large NAND erases can take far longer than a single read timeout window;
+        # retry waiting for the final response instead of failing on the first empty read.
+        result = ""
+        for _retry in range(30):
+            result = self.get_response()
+            if result:
+                break
+            self.debug(f"formatflash: waiting for erase completion (attempt {_retry+1})")
         if display:
             pg.done()
         if result == "OK":
