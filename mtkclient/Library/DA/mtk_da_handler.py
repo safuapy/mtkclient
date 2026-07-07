@@ -352,9 +352,16 @@ class DaHandler(metaclass=LogBase):
                             readlength = length
                         if display:
                             self.info(f'Dumping partition "{rpartition.name}"')
-                        if self.mtk.daloader.readflash(addr=(rpartition.sector * self.config.pagesize) + offset,
-                                                       length=readlength,
-                                                       filename=partfilename, parttype=parttype, display=display):
+                        is_nand = getattr(self.mtk.daloader.daconfig.storage, 'flashtype', None) == 'nand'
+                        if is_nand and offset == 0 and hasattr(self.mtk.daloader, 'readflash_by_name'):
+                            read_ok = self.mtk.daloader.readflash_by_name(partname=rpartition.name,
+                                                                          filename=partfilename,
+                                                                          display=display)
+                        else:
+                            read_ok = self.mtk.daloader.readflash(addr=(rpartition.sector * self.config.pagesize) + offset,
+                                                                   length=readlength,
+                                                                   filename=partfilename, parttype=parttype, display=display)
+                        if read_ok:
                             if display:
                                 self.info(f"Dumped sector {str(rpartition.sector)} with sector count " +
                                           f"{str(rpartition.sectors)} as {partfilename}.")
@@ -413,7 +420,9 @@ class DaHandler(metaclass=LogBase):
             wf.write(data)
 
         count_gpt = 0
-        for partition in guid_gpt.partentries:
+        partentries = guid_gpt if isinstance(guid_gpt, list) else guid_gpt.partentries
+        is_nand = getattr(self.mtk.daloader.daconfig.storage, 'flashtype', None) == 'nand'
+        for partition in partentries:
             partitionname = partition.name
             if partition.name in skip:
                 continue
@@ -423,12 +432,18 @@ class DaHandler(metaclass=LogBase):
                     f"Dumping partition {str(partition.name)} with sector count {str(partition.sectors)} " +
                     f"as {filename}.")
 
-            if self.mtk.daloader.readflash(addr=partition.sector * self.config.pagesize,
-                                           length=partition.sectors * self.config.pagesize,
-                                           filename=filename,
-                                           parttype=parttype,
-                                           display=display):
+            if is_nand and hasattr(self.mtk.daloader, 'readflash_by_name'):
+                ok = self.mtk.daloader.readflash_by_name(partname=partition.name,
+                                                         filename=filename,
+                                                         display=display)
+            else:
+                ok = self.mtk.daloader.readflash(addr=partition.sector * self.config.pagesize,
+                                                 length=partition.sectors * self.config.pagesize,
+                                                 filename=filename,
+                                                 parttype=parttype,
+                                                 display=display)
 
+            if ok:
                 count_gpt += 1
                 if display:
                     self.info(f"Dumped partition {str(partition.name)} as {str(filename)}.")
@@ -437,7 +452,7 @@ class DaHandler(metaclass=LogBase):
                 if display:
                     self.error(f"Failed to dump partition {str(partition.name)} as {str(filename)}.")
 
-        partitions_for_read = len(guid_gpt.partentries) - len(skip)
+        partitions_for_read = len(partentries) - len(skip)
         if count_gpt == partitions_for_read:
             if display:
                 self.info("All Dumped partitions success.")
@@ -531,6 +546,7 @@ class DaHandler(metaclass=LogBase):
             exit(0)
         if parttype == "user" or parttype is None:
             i = 0
+            is_nand = getattr(self.mtk.daloader.daconfig.storage, 'flashtype', None) == 'nand'
             for partition in partitions:
                 partfilename = filenames[i]
                 i += 1
@@ -543,10 +559,15 @@ class DaHandler(metaclass=LogBase):
                 res = self.mtk.daloader.detect_partition(partition, parttype)
                 if res[0]:
                     rpartition = res[1]
-                    if self.mtk.daloader.writeflash(addr=rpartition.sector * self.config.pagesize,
-                                                    length=rpartition.sectors * self.config.pagesize,
-                                                    filename=partfilename,
-                                                    parttype=parttype):
+                    if is_nand and hasattr(self.mtk.daloader, 'writeflash_by_name'):
+                        write_ok = self.mtk.daloader.writeflash_by_name(partname=rpartition.name,
+                                                                         filename=partfilename)
+                    else:
+                        write_ok = self.mtk.daloader.writeflash(addr=rpartition.sector * self.config.pagesize,
+                                                                 length=rpartition.sectors * self.config.pagesize,
+                                                                 filename=partfilename,
+                                                                 parttype=parttype)
+                    if write_ok:
                         print(
                             f"Wrote {partfilename} to sector {str(rpartition.sector)} with " +
                             f"sector count {str(rpartition.sectors)}.")
@@ -1254,6 +1275,14 @@ class DaHandler(metaclass=LogBase):
             data, guid_gpt = mtk.daloader.get_gpt()
             if not guid_gpt:
                 self.error('Error reading gpt, please read whole flash using "mtk rf flash.bin".')
+            elif isinstance(guid_gpt, list):
+                # PMT partition list returned (NAND device)
+                self.info("Partition table (PMT):")
+                for p in guid_gpt:
+                    if hasattr(p, 'name'):
+                        start = getattr(p, 'start', getattr(p, 'sector', 0))
+                        size = getattr(p, 'size', getattr(p, 'sectors', 0))
+                        self.info(f"  {p.name:<20} start=0x{start:08x}  size=0x{size:08x}")
             else:
                 guid_gpt.print()
         elif cmd == "r":

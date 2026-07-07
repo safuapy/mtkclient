@@ -1,10 +1,10 @@
 from queue import Queue
-def writedata(filename, rq: Queue):
+def writedata(filename, rq: Queue, mode: str = "wb"):
     """
     Optimized writer: uses buffered I/O and larger writes
     """
     try:
-        with open(filename, "wb", buffering=8*1024*1024) as wf:  # 8MB buffer
+        with open(filename, mode, buffering=8*1024*1024) as wf:  # 8MB buffer
             while True:
                 block = rq.get(timeout=300)
                 if block is None:

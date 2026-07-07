@@ -279,7 +279,12 @@ class DAloader(metaclass=LogBase):
             return [False, fpartitions]
         else:
             data, partitions = self.da.partition.read_pmt()
-            return [True, partitions]
+            if not partitions:
+                return [False, []]
+            for partition in partitions:
+                if hasattr(partition, 'name') and partition.name.lower() == partitionname.lower():
+                    return [True, partition]
+            return [False, partitions]
 
     def get_partition_data(self, parttype=None):
         if self.partition_table_category() == "GPT":
@@ -291,7 +296,7 @@ class DAloader(metaclass=LogBase):
                 return guid_gpt.partentries
         else:
             data, partitions = self.da.partition.read_pmt()
-            return [True, partitions]
+            return partitions if partitions else []
 
     def get_gpt(self, parttype=None) -> tuple:
         if self.partition_table_category() == "GPT":
@@ -332,6 +337,18 @@ class DAloader(metaclass=LogBase):
 
     def readflash(self, addr, length, filename, parttype, display=True):
         return self.da.readflash(addr=addr, length=length, filename=filename, parttype=parttype, display=display)
+
+    def readflash_by_name(self, partname: str, filename: str, display: bool = True):
+        if hasattr(self.da, 'readflash_by_name'):
+            return self.da.readflash_by_name(partname=partname, filename=filename, display=display)
+        self.error("readflash_by_name not supported by current DA mode")
+        return False
+
+    def writeflash_by_name(self, partname: str, filename: str, display: bool = True):
+        if hasattr(self.da, 'writeflash_by_name'):
+            return self.da.writeflash_by_name(partname=partname, filename=filename, display=display)
+        self.error("writeflash_by_name not supported by current DA mode")
+        return False
 
     def get_packet_length(self):
         if self.flashmode == DAmodes.XFLASH:
@@ -388,8 +405,11 @@ class DAloader(metaclass=LogBase):
             pg.done()
 
     def partition_table_category(self):
-        # if self.flashmode == damodes.XFLASH:
-        #    return self.xft.get_partition_table_category()
+        # For NAND flash, use the DA XML CMD:READ-PARTITION-TABLE (PMT path)
+        # instead of trying to read a GPT from flash sectors.
+        if hasattr(self, 'daconfig') and hasattr(self.daconfig, 'storage') and \
+                getattr(self.daconfig.storage, 'flashtype', None) == 'nand':
+            return "PMT"
         return "GPT"
 
     def poke(self, addr: int, data: bytes or bytearray, registers:bool=False):

@@ -113,7 +113,7 @@ class DAXML(metaclass=LogBase):
         while True:
             hdr = self.usbread()
             if len(hdr) not in [12,16]:
-                self.error("xread: Wrong length")
+                self.error(f"xread: Wrong length ({len(hdr)} bytes: {hdr.hex() if hdr else 'empty'})")
                 return -1, -1
             magic = int.from_bytes(hdr[:4],'little')
             if magic != 0xFEEEEEEF:
@@ -505,7 +505,7 @@ class DAXML(metaclass=LogBase):
             self.error("No upload data received. Aborting.")
             return False
 
-    def download_raw(self, result, filename: str = "", display: bool = False):
+    def download_raw(self, result, filename: str = "", display: bool = False, append_mode: bool = False):
         rq = Queue()
         if type(result) is UpFile:
             # checksum = result.checksum
@@ -518,7 +518,15 @@ class DAXML(metaclass=LogBase):
                 length = int(tmp[2:], 16)
                 pg = progress(total=length, prefix="Read:", guiprogress=self.mtk.config.guiprogress)
                 self.ack()
-                sresp = self.get_response()
+                # DA may take extra time to seek on non-zero offset reads; retry a few times
+                sresp = ""
+                for _retry in range(10):
+                    sresp = self.get_response()
+                    if sresp:
+                        break
+                    self.debug(f"download_raw: waiting for OK (attempt {_retry+1})")
+                if "OK" not in sresp:
+                    self.warning(f"download_raw: expected OK after OK@, got {sresp!r}")
                 if "OK" in sresp:
                     self.ack()
                     data = bytearray()
@@ -526,7 +534,8 @@ class DAXML(metaclass=LogBase):
                     bytestoread = length
                     worker = None
                     if filename != "":
-                        worker = Thread(target=writedata, args=(filename, rq), daemon=True)
+                        fmode = "ab" if append_mode else "wb"
+                        worker = Thread(target=writedata, args=(filename, rq, fmode), daemon=True)
                         worker.start()
                     while bytestoread > 0:
                         tmp = self.get_response_data()
@@ -654,6 +663,20 @@ class DAXML(metaclass=LogBase):
                 self.info("Successfully booted to stage 2")
                 self.setup_hw_init()
                 self.change_usb_speed()
+                # DA stage 2 re-enumerates USB after speed negotiation;
+                # reconnect before SLA check (mirrors xflash_lib.py behaviour)
+                import time
+                time.sleep(1)
+                try:
+                    self.mtk.port.close(reset=False)
+                    time.sleep(2)
+                    for _ in range(20):
+                        if self.mtk.port.cdc.connect():
+                            self.info("Reconnected to DA stage 2")
+                            break
+                        time.sleep(0.5)
+                except Exception as e:
+                    self.warning(f"USB reconnect attempt failed: {e}")
                 res = self.check_sla()
                 if isinstance(res, bool):
                     if not res:
@@ -703,7 +726,11 @@ class DAXML(metaclass=LogBase):
             self.reinit(True)
             self.check_lifecycle()
             if self.mtk.daloader.patch:
-                xdata = self.xmlft.patch()
+                try:
+                    xdata = self.xmlft.patch()
+                except Exception as e:
+                    self.warning(f"DA patching skipped (modem DA has no standard patterns): {e}")
+                    xdata = None
                 """
                 i=0
                 val=self.read_register(0x4006E4C0)
@@ -712,7 +739,7 @@ class DAXML(metaclass=LogBase):
                     i+=4
                 """
                 xmlcmd = self.cmd.create_cmd("CUSTOM")
-                if self.xsend(xmlcmd):
+                if xdata is not None and self.xsend(xmlcmd):
                     # result =
                     data = self.get_response()
                     if data == 'OK':
@@ -830,12 +857,13 @@ class DAXML(metaclass=LogBase):
                         self.cid = get_field(data, "emmc_cid")
                 elif storagetype == "NAND":
                     self.daconfig.storage.flashtype = "nand"
-                    self.daconfig.storage.nand.block_size = int(get_field(data, "block_size"), 16)
-                    self.daconfig.storage.nand.page_size = int(get_field(data, "page_size"), 16)
-                    self.daconfig.storage.nand.spare_size = int(get_field(data, "spare_size"), 16)
-                    self.daconfig.storage.nand.total_size = int(get_field(data, "total_size"), 16)
+                    def _hex(field): return int(get_field(data, field) or "0", 16)
+                    self.daconfig.storage.nand.block_size = _hex("block_size")
+                    self.daconfig.storage.nand.page_size = _hex("page_size")
+                    self.daconfig.storage.nand.spare_size = _hex("spare_size")
+                    self.daconfig.storage.nand.total_size = _hex("total_size")
                     self.daconfig.storage.nand.cid = get_field(data, "id")
-                    self.daconfig.storage.nand.page_parity_size = int(get_field(data, "page_parity_size"), 16)
+                    self.daconfig.storage.nand.page_parity_size = _hex("page_parity_size")
                     self.daconfig.storage.nand.sub_type = get_field(data, "sub_type")
                     self.daconfig.storage.set_flash_size()
                 else:
@@ -849,7 +877,7 @@ class DAXML(metaclass=LogBase):
                                     0x10,                                                 , 1
         """
         data = self.get_sys_property(key="DA.SLA", length=0x200000)
-        if data is None:
+        if data is None or isinstance(data, bool):
             return False
         data = data.decode('utf-8')
         if "item key=" in data:
@@ -893,10 +921,13 @@ class DAXML(metaclass=LogBase):
             tcmd, tresult = self.get_command_result()
 
             class PartitionTable:
-                def __init__(self, name, start, size):
+                def __init__(self, name, sector, sectors):
                     self.name = name
-                    self.start = start
-                    self.size = size
+                    self.sector = sector    # start offset in pages
+                    self.sectors = sectors  # size in pages
+                    # aliases for compatibility
+                    self.start = sector
+                    self.size = sectors
 
             if tresult == "START":
                 parttbl = []
@@ -906,7 +937,7 @@ class DAXML(metaclass=LogBase):
                     if name != '':
                         start = get_field(item, "start")
                         rsize = get_field(item, "size")
-                        if size == "":
+                        if not rsize:
                             continue
                         rsize = int(rsize, 16)
                         start = int(start, 16)
@@ -915,30 +946,130 @@ class DAXML(metaclass=LogBase):
                 return data, parttbl
         return b"", None
 
+    def readflash_by_name(self, partname: str, filename: str, display: bool = True):
+        """Read a named partition via CMD:READ-PARTITION (bypasses NAND-WHOLE offset limit)."""
+        if not self.send_command(self.cmd.cmd_read_partition(partname), noack=True):
+            self.error(f"READ-PARTITION not supported for {partname}")
+            return False
+        cmd, result = self.get_command_result()
+        if type(result) is not UpFile:
+            self.error(f"READ-PARTITION {partname} returned: {result}")
+            return False
+        pre_size = os.path.getsize(filename) if filename and os.path.exists(filename) else 0
+        data = self.download_raw(result=result, filename=filename, display=display)
+        if filename:
+            post_size = os.path.getsize(filename) if os.path.exists(filename) else 0
+            return post_size > pre_size
+        return bool(data)
+
     def readflash(self, addr, length, filename, parttype=None, display=True) -> (bytes, bool):
         partinfo = self.daconfig.storage.get_storage(parttype, length)
         if not partinfo:
             return b""
         storage, parttype, length = partinfo
 
-        if self.send_command(self.cmd.cmd_read_flash(parttype, addr, length), noack=True):
+        # DA firmware delivers at most 0x1A00000 bytes per READ-FLASH session.
+        # Request in explicit batches of that size so each batch terminates cleanly
+        # and the DA may accept the next command.
+        DA_BATCH_LIMIT = 0x1A00000
+        total_written = 0
+        accumulated = bytearray()
+        first_batch = True
+
+        while total_written < length:
+            batch_addr = addr + total_written
+            batch_len = min(DA_BATCH_LIMIT, length - total_written)
+
+            if not self.send_command(self.cmd.cmd_read_flash(parttype, batch_addr, batch_len), noack=True):
+                if total_written == 0:
+                    self.error("Read flash isn't supported")
+                    sys.exit(1)
+                self.warning(f"DA stopped accepting commands after {hex(total_written)} bytes; stopping here")
+                break
+
             cmd, result = self.get_command_result()
             if type(result) is not UpFile:
-                self.error(result)
-                return b""
-            data = self.download_raw(result=result, filename=filename, display=display)
-            scmd, sresult = self.get_command_result()
-            if sresult == "START":
-                if not filename:
-                    return data
-                else:
-                    return True
-            if not filename:
-                return b""
+                if total_written == 0:
+                    self.error(str(result))
+                    return b"" if not filename else False
+                self.warning(f"DA command result failed after {hex(total_written)} bytes; stopping")
+                break
+
+            pre_size = os.path.getsize(filename) if filename and os.path.exists(filename) else 0
+            data = self.download_raw(result=result, filename=filename, display=display,
+                                     append_mode=not first_batch)
+            first_batch = False
+
+            if filename:
+                post_size = os.path.getsize(filename) if os.path.exists(filename) else 0
+                batch_written = post_size - pre_size
+            else:
+                batch_written = len(data) if data else 0
+                if data:
+                    accumulated.extend(data)
+
+            if batch_written == 0:
+                self.warning("No data received in batch, stopping")
+                break
+
+            total_written += batch_written
+            self.info(f"Batch done: {hex(batch_written)} bytes, total {hex(total_written)}/{hex(length)}")
+
+            # Consume post-batch DA state (CMD:START signals ready; silence is also OK)
+            try:
+                scmd, sresult = self.get_command_result()
+            except Exception:
+                sresult = ""
+
+            if total_written >= length:
+                break
+
+            if sresult != "START":
+                self.warning(f"DA not ready for next batch (sresult={sresult!r}); stopping at {hex(total_written)}")
+                break
+
+        if not filename:
+            return bytes(accumulated)
+        return total_written > 0
+
+    def writeflash_by_name(self, partname: str, filename: str, display: bool = True) -> bool:
+        """Write a file to a named partition via CMD:WRITE-PARTITION (bypasses NAND-WHOLE offset limit)."""
+        if not os.path.exists(filename):
+            self.error(f"File not found: {filename}")
             return False
-        else:
-            self.error("Read flash isn't supported")
-            sys.exit(1)
+        length = os.stat(filename).st_size
+        if length % 512 != 0:
+            length += 512 - (length % 512)
+
+        self.send_command(self.cmd.cmd_write_partition_by_name(partition=partname, mem_length=length), noack=True)
+
+        # Consume up to 4 FileSysOp handshake steps before we expect DwnFile
+        for _ in range(4):
+            cmd, result = self.get_command_result()
+            if not isinstance(result, FileSysOp):
+                break
+            if result.key == "EXISTS":
+                # DA asks: partition exists, overwrite? Reply 1 = yes
+                self.ack_value(1)
+            elif result.key == "FILE-SIZE":
+                # DA asks for the data length
+                self.ack_value(length)
+            else:
+                self.error(f"writeflash_by_name: unhandled FileSysOp key {result.key!r}")
+                return False
+
+        if type(result) is DwnFile:
+            with open(filename, "rb") as fh:
+                data = fh.read(length)
+            if len(data) % 512 != 0:
+                data += b"\x00" * (512 - len(data) % 512)
+            if not self.upload(result, data, raw=True):
+                self.error(f"Error uploading {filename} to partition {partname}")
+                return False
+            return True
+
+        self.error(f"writeflash_by_name {partname}: unexpected response {result!r}")
+        return False
 
     def writeflash(self, addr, length, filename, offset=0, parttype=None, wdata=None, display=True):
         fh = None

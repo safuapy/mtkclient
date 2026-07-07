@@ -354,4 +354,15 @@ class Storage(metaclass=LogBase):
                 parttype = EmmcPartitionType.MTK_DA_EMMC_PART_USER
             self.flashsize = self.nor.available_size
         length = min(length, self.flashsize)
+        # Some DA firmware rejects reads where length == total flash size (off-by-one
+        # in DA boundary check). Trim by one block when requesting the full flash.
+        if length > 0 and length == self.flashsize:
+            block = 0
+            if self.flashtype == "nand" and self.nand.block_size > 0:
+                block = self.nand.block_size
+            elif self.flashtype == "emmc" and self.emmc.block_size > 0:
+                block = self.emmc.block_size
+            if block == 0:
+                block = 0x20000  # 128 KB default block
+            length -= block
         return [storage, parttype, length]
